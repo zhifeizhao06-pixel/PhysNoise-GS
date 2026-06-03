@@ -353,7 +353,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print(f"  [线性域]  pred_mean={diag['ema_linear_pred_mean']:.4f}  gt_mean={diag['ema_linear_gt_mean']:.4f}  ratio={diag['ema_linear_ratio']:.3f}")
                 print(f"            {'✓ 尺度对齐' if 0.5<diag['ema_linear_ratio']<2.0 else '✗ 尺度偏差过大，检查逆gamma或sensor_gain参数'}")
                 print(f"  [噪声]    σ²={diag['ema_sigma2_mean']:.6f}  SNR={diag['ema_snr_mean']:.2f}")
-                print(f"            {'✓ SNR合理' if diag['ema_snr_mean']>1.0 else '✗ SNR<1，noise_a/b过大，暗区被完全忽略'}")
+                # 检测 b 是否主导 σ²（b主导时 NLL 退化为 L2）
+                b_ratio = opt.noise_b / (diag['ema_sigma2_mean'] + 1e-12)
+                if b_ratio > 0.8:
+                    print(f"            ✗ b={opt.noise_b}主导σ²({b_ratio*100:.0f}%)，NLL退化为L2！")
+                    suggested_b = diag['ema_linear_gt_mean'] * 0.0001
+                    print(f"            → 建议: --noise_b {suggested_b:.2e}  --noise_a 0.2")
+                elif diag['ema_snr_mean'] < 1.0:
+                    print(f"            ✗ SNR<1，noise_a/b过大，暗区被完全忽略")
+                else:
+                    print(f"            ✓ SNR合理，噪声模型参数匹配")
                 print(f"  [暗/亮区] dark_L1={diag['ema_dark_l1']:.5f}  bright_L1={diag['ema_bright_l1']:.5f}")
                 print(f"  [NLL权重] dark={diag['ema_dark_weight']:.4f}  bright={diag['ema_bright_weight']:.4f}")
                 weight_ratio = diag['ema_bright_weight'] / (diag['ema_dark_weight'] + 1e-8)

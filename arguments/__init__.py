@@ -100,9 +100,12 @@ class OptimizationParams(ParamGroup):
         # ---- PhysNoise-GS 新增参数 ----
         # 是否启用 RAW 域 NLL 损失（阶段1核心开关）
         self.use_raw_nll = False
-        # CMOS 噪声参数（离线标定值；无标定数据时设为经验值 a=0.01, b=0.001）
-        self.noise_a = 0.01
-        self.noise_b = 0.001
+        # CMOS 噪声参数（针对逆gamma后线性域，值域约0~0.1的低光PNG场景）
+        # a: shot noise系数，建议 0.1~0.5（使σ²随信号变化）
+        # b: read noise方差，建议 1e-6~1e-7（远小于信号，避免σ²退化为常数）
+        # 错误示例：b=0.001（信号均值~0.015时，b完全主导σ²，退化为L2）
+        self.noise_a = 0.2
+        self.noise_b = 1e-6
         # 传感器增益 = ISO/100 * 曝光时间（用于线性辐射→RAW转换）
         self.sensor_gain = 1.0
         # 黑电平（减去后 RAW 值应≥0）

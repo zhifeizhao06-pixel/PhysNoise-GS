@@ -58,8 +58,13 @@ class CMOSNoiseModel:
         逐像素噪声方差：σ²(x̂) = a·x̂ + b
         expected_raw: 期望 RAW 值（已经 detach，stop-gradient）
         返回同形状的方差张量，clamp 防止数值问题
+
+        参数选取建议（逆gamma后线性域，值域约0~0.1的低光场景）：
+          a = 0.1  ~ 0.5   （shot noise，使亮区σ²明显大于暗区）
+          b = 1e-6 ~ 1e-7  （read noise floor，远小于信号均值）
+        错误参数示例：b=0.001（远大于信号，σ²≈常数，退化为L2）
         """
-        return (self.a * expected_raw + self.b).clamp(min=1e-6)
+        return (self.a * expected_raw + self.b).clamp(min=1e-8)
 
     def nll_loss(self, pred_linear: torch.Tensor,
                  target_raw: torch.Tensor) -> torch.Tensor:
