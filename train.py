@@ -163,23 +163,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if viewpoint_cam.alpha_mask is not None:
                 linear_image = linear_image * viewpoint_cam.alpha_mask.cuda()
 
-            # warm-up 阶段用 SNR 加权 L1，之后切换到完整 NLL
-            # （防止训练初期 NLL 不稳定）
+            # PNG/JPG 是 sRGB（经过 gamma 压缩），需要逆 gamma 还原到线性域
+            # sRGB 标准近似：linear ≈ srgb^2.2
+            # 两侧保持一致：渲染输出是线性辐射，GT 也转到线性域再比较
+            gt_linear = gt_image.clamp(min=1e-6) ** 2.2
+
+            # warm-up 阶段用 SNR 加权 L1（更稳定），之后切换到完整 NLL
             if iteration < opt.nll_warmup_iter:
                 pred_raw = noise_model.linear_to_raw(linear_image)
-                loss = snr_weighted_l1(pred_raw, gt_image,
+                gt_raw   = noise_model.linear_to_raw(gt_linear)
+                loss = snr_weighted_l1(pred_raw, gt_raw,
                                        a=opt.noise_a, b=opt.noise_b)
             else:
-                loss = noise_model.nll_loss(linear_image, gt_image)
+                loss = noise_model.nll_loss(linear_image, gt_linear)
 
-            # 可选：经 ISP 后加感知损失
+            # sRGB 感知监督：渲染线性值经 gamma 压缩后与原始 GT 比较
+            # 这样 SSIM 在感知上一致的 sRGB 域计算，补偿纯 NLL 的感知不足
+            srgb_pred = linear_image.clamp(min=0) ** (1.0 / 2.2)   # 简单 gamma 压缩
+            if FUSED_SSIM_AVAILABLE:
+                ssim_value = fused_ssim(srgb_pred.unsqueeze(0), gt_image.unsqueeze(0))
+            else:
+                ssim_value = ssim(srgb_pred, gt_image)
+            loss = loss + opt.lambda_dssim * (1.0 - ssim_value)
+
+            # 可选：可微 ISP 感知损失（lambda_perc > 0 时额外叠加）
             if isp_model is not None and opt.lambda_perc > 0:
-                srgb_pred = isp_model(linear_image)
-                srgb_gt   = isp_model(gt_image)          # GT 也过同一 ISP，保证公平
+                srgb_isp_pred = isp_model(linear_image)
+                srgb_isp_gt   = isp_model(gt_linear)
                 if FUSED_SSIM_AVAILABLE:
-                    ssim_perc = fused_ssim(srgb_pred.unsqueeze(0), srgb_gt.unsqueeze(0))
+                    ssim_perc = fused_ssim(srgb_isp_pred.unsqueeze(0), srgb_isp_gt.unsqueeze(0))
                 else:
-                    ssim_perc = ssim(srgb_pred, srgb_gt)
+                    ssim_perc = ssim(srgb_isp_pred, srgb_isp_gt)
                 loss = loss + opt.lambda_perc * (1.0 - ssim_perc)
 
             Ll1 = loss  # 用于日志记录
