@@ -116,9 +116,15 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
-    rendered_image = rendered_image.clamp(0, 1)
+    #
+    # PhysNoise-GS: 当使用 RAW NLL 损失时，输出线性辐射（不 clamp 到 [0,1]）
+    # 线性辐射须为非负，用 relu 代替 clamp(0,1) 的上界裁剪
+    # 在标准 sRGB 模式下保留原有 clamp(0,1) 行为
+    linear_render = rendered_image.clamp(min=0.0)           # 非负线性辐射（PhysNoise用）
+    rendered_image = rendered_image.clamp(0, 1)             # sRGB 兼容输出（原版行为）
     out = {
         "render": rendered_image,
+        "render_linear": linear_render,                     # PhysNoise-GS: 线性辐射输出
         "viewspace_points": screenspace_points,
         "visibility_filter" : (radii > 0).nonzero(),
         "radii": radii,

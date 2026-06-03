@@ -97,6 +97,24 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
+        # ---- PhysNoise-GS 新增参数 ----
+        # 是否启用 RAW 域 NLL 损失（阶段1核心开关）
+        self.use_raw_nll = False
+        # CMOS 噪声参数（离线标定值；无标定数据时设为经验值 a=0.01, b=0.001）
+        self.noise_a = 0.01
+        self.noise_b = 0.001
+        # 传感器增益 = ISO/100 * 曝光时间（用于线性辐射→RAW转换）
+        self.sensor_gain = 1.0
+        # 黑电平（减去后 RAW 值应≥0）
+        self.black_level = 0.0
+        # 是否使用可学习噪声参数（无标定数据时设 True）
+        self.learnable_noise = False
+        # 感知损失权重（经可微 ISP 后的 SSIM 损失，0=不用）
+        self.lambda_perc = 0.0
+        # 不确定性致密化：低于此 SNR 的高斯不做 clone/split
+        self.snr_threshold = 3.0
+        # warm-up 阶段迭代数（warm-up 期间用 SNR 加权 L1，之后切换到 NLL）
+        self.nll_warmup_iter = 1000
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

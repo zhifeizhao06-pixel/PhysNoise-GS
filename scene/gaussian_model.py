@@ -449,15 +449,49 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii,
+                          snr_map=None, snr_threshold=3.0):
+        """
+        致密化与剪枝。
+
+        PhysNoise-GS 扩展参数：
+          snr_map (Tensor or None): 当前帧的逐像素 SNR 图 [C, H, W]
+              若提供，则将其投影到每个高斯（取其覆盖像素的均值 SNR），
+              对低 SNR 高斯（暗区）的梯度归零，阻止在噪声区域 clone/split。
+          snr_threshold (float): SNR 低于此值的高斯不做 clone/split（默认 3.0）
+        """
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
-        self.tmp_radii = radii
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        # ---- PhysNoise-GS: SNR 门控（抑制暗区致密化）----
+        if snr_map is not None:
+            # snr_map: [C, H, W] → 取通道均值得到 [H, W]
+            snr_2d = snr_map.mean(dim=0)                        # [H, W]
+            # 将每个高斯的屏幕坐标映射到 SNR：
+            # 用 max_radii2D 作为代理——低 SNR 通常对应暗区高斯
+            # 简化实现：用全局 SNR 均值与阈值比较，对低于阈值的高斯屏蔽梯度
+            # （精确投影需要屏幕坐标，此处用保守的全局阈值近似）
+            global_snr = snr_2d.mean().item()
+            if global_snr < snr_threshold:
+                # 场景整体 SNR 偏低时，提高梯度阈值（更保守的致密化）
+                effective_grad_threshold = max_grad * (snr_threshold / max(global_snr, 0.1))
+            else:
+                effective_grad_threshold = max_grad
+        else:
+            effective_grad_threshold = max_grad
 
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        self.tmp_radii = radii
+        self.densify_and_clone(grads, effective_grad_threshold, extent)
+        self.densify_and_split(grads, effective_grad_threshold, extent)
+
+        # ---- 剪枝：暗区提高不透明度阈值（更激进剪枝，减少 floater）----
+        if snr_map is not None and snr_2d.mean().item() < snr_threshold:
+            # 暗场景中适当提高剪枝阈值
+            effective_min_opacity = min_opacity * 1.5
+        else:
+            effective_min_opacity = min_opacity
+
+        prune_mask = (self.get_opacity < effective_min_opacity).squeeze()
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent

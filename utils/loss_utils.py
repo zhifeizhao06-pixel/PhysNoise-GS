@@ -18,6 +18,55 @@ try:
 except:
     pass
 
+
+# ============================================================
+# PhysNoise-GS: 异方差 NLL 损失（方案 4.1 节）
+# ============================================================
+
+def heteroscedastic_nll(pred_raw: torch.Tensor,
+                        target_raw: torch.Tensor,
+                        a: float,
+                        b: float,
+                        clip_min: float = 1e-6) -> torch.Tensor:
+    """
+    异方差高斯负对数似然损失。
+
+    σ²(x̂) = a·x̂ + b   （信号相关方差，物理噪声模型）
+    L = (x̂ - D)² / (2σ²) + 0.5·log(σ²)
+
+    注意：σ² 中的 x̂ 使用 .detach()（stop-gradient），
+    防止模型靠放大方差来降低损失。
+
+    Args:
+        pred_raw:   模型预测的 RAW 值（由线性辐射经增益转换得到），[C, H, W]
+        target_raw: 真实 RAW 观测（已归一化），[C, H, W]
+        a:          shot noise 系数（标定值或经验值）
+        b:          read noise 方差（标定值或经验值）
+        clip_min:   方差下界（数值稳定性）
+    Returns:
+        标量损失
+    """
+    sigma2 = (a * pred_raw.detach() + b).clamp(min=clip_min)
+    loss = (pred_raw - target_raw) ** 2 / (2.0 * sigma2) \
+           + 0.5 * torch.log(sigma2)
+    return loss.mean()
+
+
+def snr_weighted_l1(pred: torch.Tensor,
+                    target: torch.Tensor,
+                    a: float,
+                    b: float,
+                    clip_min: float = 1e-6) -> torch.Tensor:
+    """
+    SNR 加权 L1 损失（NLL 的简化版，用于 warm-up 阶段）。
+    暗区（低 SNR）自动降低权重，亮区（高 SNR）权重高。
+
+    weight(x̂) = 1 / σ(x̂) = 1 / sqrt(a·x̂ + b)
+    """
+    sigma2 = (a * pred.detach() + b).clamp(min=clip_min)
+    weight = 1.0 / sigma2.sqrt()
+    return (weight * torch.abs(pred - target)).mean()
+
 C1 = 0.01 ** 2
 C2 = 0.03 ** 2
 

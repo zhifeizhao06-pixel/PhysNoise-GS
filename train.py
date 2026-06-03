@@ -12,7 +12,7 @@
 import os
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim
+from utils.loss_utils import l1_loss, ssim, heteroscedastic_nll, snr_weighted_l1
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -22,6 +22,11 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+
+# PhysNoise-GS 新增导入
+from utils.noise_model import CMOSNoiseModel, LearnableCMOSNoiseModel
+from utils.isp import DifferentiableISP
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -50,6 +55,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+
+    # ================================================================
+    # PhysNoise-GS: 初始化噪声模型和可微 ISP
+    # ================================================================
+    if opt.use_raw_nll:
+        if opt.learnable_noise:
+            noise_model = LearnableCMOSNoiseModel(
+                a_init=opt.noise_a,
+                b_init=opt.noise_b,
+                gain=opt.sensor_gain,
+                black_level=opt.black_level,
+            ).cuda()
+            print(f"[PhysNoise-GS] 使用可学习噪声模型 (a_init={opt.noise_a}, b_init={opt.noise_b})")
+        else:
+            noise_model = CMOSNoiseModel(
+                a=opt.noise_a,
+                b=opt.noise_b,
+                gain=opt.sensor_gain,
+                black_level=opt.black_level,
+            )
+            print(f"[PhysNoise-GS] 使用标定噪声模型 (a={opt.noise_a}, b={opt.noise_b})")
+
+        # 可微 ISP（用于感知损失，lambda_perc > 0 时启用）
+        isp_model = None
+        if opt.lambda_perc > 0:
+            isp_model = DifferentiableISP(learnable_wb=True, learnable_ccm=True).cuda()
+            print(f"[PhysNoise-GS] 启用可微 ISP（lambda_perc={opt.lambda_perc}）")
+    else:
+        noise_model = None
+        isp_model = None
+        print("[PhysNoise-GS] 使用标准 sRGB L1+SSIM 损失（原版模式）")
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -115,15 +151,47 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
             image *= alpha_mask
 
-        # Loss
+        # ================================================================
+        # PhysNoise-GS: 损失计算分支
+        # ================================================================
         gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        if FUSED_SSIM_AVAILABLE:
-            ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
-        else:
-            ssim_value = ssim(image, gt_image)
 
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        if opt.use_raw_nll and noise_model is not None:
+            # --- RAW 域物理噪声似然损失 ---
+            # render_linear: 线性辐射输出（非负，未 clamp 到1）
+            linear_image = render_pkg["render_linear"]
+            if viewpoint_cam.alpha_mask is not None:
+                linear_image = linear_image * viewpoint_cam.alpha_mask.cuda()
+
+            # warm-up 阶段用 SNR 加权 L1，之后切换到完整 NLL
+            # （防止训练初期 NLL 不稳定）
+            if iteration < opt.nll_warmup_iter:
+                pred_raw = noise_model.linear_to_raw(linear_image)
+                loss = snr_weighted_l1(pred_raw, gt_image,
+                                       a=opt.noise_a, b=opt.noise_b)
+            else:
+                loss = noise_model.nll_loss(linear_image, gt_image)
+
+            # 可选：经 ISP 后加感知损失
+            if isp_model is not None and opt.lambda_perc > 0:
+                srgb_pred = isp_model(linear_image)
+                srgb_gt   = isp_model(gt_image)          # GT 也过同一 ISP，保证公平
+                if FUSED_SSIM_AVAILABLE:
+                    ssim_perc = fused_ssim(srgb_pred.unsqueeze(0), srgb_gt.unsqueeze(0))
+                else:
+                    ssim_perc = ssim(srgb_pred, srgb_gt)
+                loss = loss + opt.lambda_perc * (1.0 - ssim_perc)
+
+            Ll1 = loss  # 用于日志记录
+
+        else:
+            # --- 原版 sRGB L1 + SSIM 损失 ---
+            Ll1 = l1_loss(image, gt_image)
+            if FUSED_SSIM_AVAILABLE:
+                ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+            else:
+                ssim_value = ssim(image, gt_image)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
         # Depth regularization
         Ll1depth_pure = 0.0
@@ -168,7 +236,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+
+                    # PhysNoise-GS: 计算 SNR map 用于不确定性感知致密化
+                    snr_map = None
+                    if opt.use_raw_nll and noise_model is not None:
+                        with torch.no_grad():
+                            linear_image = render_pkg["render_linear"]
+                            snr_map = noise_model.snr_map(linear_image)  # [C, H, W]
+
+                    gaussians.densify_and_prune(
+                        opt.densify_grad_threshold, 0.005,
+                        scene.cameras_extent, size_threshold, radii,
+                        snr_map=snr_map,
+                        snr_threshold=opt.snr_threshold,
+                    )
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
