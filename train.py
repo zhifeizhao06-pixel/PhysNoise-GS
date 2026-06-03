@@ -96,13 +96,38 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
-    use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
+    use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
+
+    # ================================================================
+    # PhysNoise-GS: 诊断统计变量（用于判断改进是否有效）
+    # ================================================================
+    diag = {
+        # 损失对比
+        "ema_nll_loss":        0.0,   # NLL 损失（PhysNoise 模式）
+        "ema_l1_srgb":         0.0,   # sRGB L1（两种模式都记录，用于横向对比）
+        "ema_ssim":            0.0,   # SSIM 值
+        # 线性域健康度（判断逆 gamma 是否正确）
+        "ema_linear_pred_mean": 0.0,  # 渲染线性辐射均值（应在合理范围）
+        "ema_linear_gt_mean":   0.0,  # GT 逆 gamma 后均值（应与上面接近）
+        "ema_linear_ratio":     0.0,  # pred/gt 比值（接近1说明尺度对齐）
+        # 噪声模型健康度
+        "ema_sigma2_mean":     0.0,   # 平均噪声方差（判断 a/b 参数合理性）
+        "ema_snr_mean":        0.0,   # 平均 SNR（低于1说明噪声模型过强）
+        # 暗区 vs 亮区分析（核心：NLL 是否真的对暗区降权了）
+        "ema_dark_l1":         0.0,   # 暗区（GT<0.1）的 L1
+        "ema_bright_l1":       0.0,   # 亮区（GT>0.5）的 L1
+        "ema_dark_weight":     0.0,   # 暗区的 NLL 权重均值（越小越好）
+        "ema_bright_weight":   0.0,   # 亮区的 NLL 权重均值
+        # 高斯数量趋势（判断 floater 是否受控）
+        "num_gaussians":       0,
+    }
+    DIAG_ALPHA = 0.01   # EMA 平滑系数（比 loss 的 0.4 更平滑，看趋势用）
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -198,6 +223,46 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             Ll1 = loss  # 用于日志记录
 
+            # ---- 诊断统计（PhysNoise 模式）----
+            with torch.no_grad():
+                # 1. 线性域尺度检查：pred 和 gt 均值是否对齐
+                pred_mean = linear_image.mean().item()
+                gt_mean   = gt_linear.mean().item()
+                ratio     = pred_mean / (gt_mean + 1e-8)
+                diag["ema_linear_pred_mean"] = (1-DIAG_ALPHA)*diag["ema_linear_pred_mean"] + DIAG_ALPHA*pred_mean
+                diag["ema_linear_gt_mean"]   = (1-DIAG_ALPHA)*diag["ema_linear_gt_mean"]   + DIAG_ALPHA*gt_mean
+                diag["ema_linear_ratio"]     = (1-DIAG_ALPHA)*diag["ema_linear_ratio"]     + DIAG_ALPHA*ratio
+
+                # 2. 噪声模型健康度：方差和 SNR 是否合理
+                pred_raw_d = noise_model.linear_to_raw(linear_image)
+                sigma2     = noise_model.noise_variance(pred_raw_d)
+                snr        = pred_raw_d / (sigma2.sqrt() + 1e-8)
+                diag["ema_sigma2_mean"] = (1-DIAG_ALPHA)*diag["ema_sigma2_mean"] + DIAG_ALPHA*sigma2.mean().item()
+                diag["ema_snr_mean"]    = (1-DIAG_ALPHA)*diag["ema_snr_mean"]    + DIAG_ALPHA*snr.mean().item()
+
+                # 3. 暗区 vs 亮区 L1 分析（在 sRGB 域判断）
+                dark_mask   = gt_image < 0.1    # 暗区像素（sRGB）
+                bright_mask = gt_image > 0.5    # 亮区像素
+                srgb_pred_d = linear_image.clamp(min=0) ** (1.0/2.2)
+                if dark_mask.sum() > 0:
+                    dark_l1   = torch.abs(srgb_pred_d[dark_mask]   - gt_image[dark_mask]).mean().item()
+                    diag["ema_dark_l1"] = (1-DIAG_ALPHA)*diag["ema_dark_l1"] + DIAG_ALPHA*dark_l1
+                    # NLL 在暗区的实际权重 = 1/(2σ²)，越小说明暗区被越弱惩罚
+                    dark_weight = (1.0 / (2.0 * sigma2[dark_mask])).mean().item()
+                    diag["ema_dark_weight"] = (1-DIAG_ALPHA)*diag["ema_dark_weight"] + DIAG_ALPHA*dark_weight
+                if bright_mask.sum() > 0:
+                    bright_l1 = torch.abs(srgb_pred_d[bright_mask] - gt_image[bright_mask]).mean().item()
+                    diag["ema_bright_l1"] = (1-DIAG_ALPHA)*diag["ema_bright_l1"] + DIAG_ALPHA*bright_l1
+                    bright_weight = (1.0 / (2.0 * sigma2[bright_mask])).mean().item()
+                    diag["ema_bright_weight"] = (1-DIAG_ALPHA)*diag["ema_bright_weight"] + DIAG_ALPHA*bright_weight
+
+                # 4. sRGB L1（与 baseline 可比的指标）
+                srgb_l1 = torch.abs(srgb_pred_d - gt_image).mean().item()
+                diag["ema_l1_srgb"] = (1-DIAG_ALPHA)*diag["ema_l1_srgb"] + DIAG_ALPHA*srgb_l1
+                diag["ema_ssim"]    = (1-DIAG_ALPHA)*diag["ema_ssim"]     + DIAG_ALPHA*ssim_value.item()
+                diag["ema_nll_loss"]= (1-DIAG_ALPHA)*diag["ema_nll_loss"] + DIAG_ALPHA*loss.item()
+                diag["num_gaussians"] = gaussians.get_xyz.shape[0]
+
         else:
             # --- 原版 sRGB L1 + SSIM 损失 ---
             Ll1 = l1_loss(image, gt_image)
@@ -206,6 +271,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             else:
                 ssim_value = ssim(image, gt_image)
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+
+            # ---- 诊断统计（baseline 模式）----
+            with torch.no_grad():
+                diag["ema_l1_srgb"] = (1-DIAG_ALPHA)*diag["ema_l1_srgb"] + DIAG_ALPHA*Ll1.item()
+                diag["ema_ssim"]    = (1-DIAG_ALPHA)*diag["ema_ssim"]     + DIAG_ALPHA*ssim_value.item()
+                dark_mask   = gt_image < 0.1
+                bright_mask = gt_image > 0.5
+                if dark_mask.sum() > 0:
+                    diag["ema_dark_l1"]   = (1-DIAG_ALPHA)*diag["ema_dark_l1"]   + DIAG_ALPHA*torch.abs(image[dark_mask]-gt_image[dark_mask]).mean().item()
+                if bright_mask.sum() > 0:
+                    diag["ema_bright_l1"] = (1-DIAG_ALPHA)*diag["ema_bright_l1"] + DIAG_ALPHA*torch.abs(image[bright_mask]-gt_image[bright_mask]).mean().item()
+                diag["num_gaussians"] = gaussians.get_xyz.shape[0]
 
         # Depth regularization
         Ll1depth_pure = 0.0
@@ -231,10 +308,58 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
+                if opt.use_raw_nll:
+                    progress_bar.set_postfix({
+                        "Loss":    f"{ema_loss_for_log:.5f}",
+                        "L1_rgb":  f"{diag['ema_l1_srgb']:.4f}",
+                        "SNR":     f"{diag['ema_snr_mean']:.2f}",
+                        "#GS":     f"{diag['num_gaussians']//1000}k",
+                    })
+                else:
+                    progress_bar.set_postfix({
+                        "Loss":    f"{ema_loss_for_log:.5f}",
+                        "L1_rgb":  f"{diag['ema_l1_srgb']:.4f}",
+                        "#GS":     f"{diag['num_gaussians']//1000}k",
+                    })
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
+
+            # ---- PhysNoise-GS: 诊断信息写入 TensorBoard ----
+            if tb_writer and opt.use_raw_nll:
+                # 损失对比
+                tb_writer.add_scalar('diag/nll_loss',         diag['ema_nll_loss'],        iteration)
+                tb_writer.add_scalar('diag/l1_srgb',          diag['ema_l1_srgb'],         iteration)
+                tb_writer.add_scalar('diag/ssim',             diag['ema_ssim'],            iteration)
+                # 线性域健康度（关键：判断逆gamma是否正确）
+                tb_writer.add_scalar('diag/linear_pred_mean', diag['ema_linear_pred_mean'],iteration)
+                tb_writer.add_scalar('diag/linear_gt_mean',   diag['ema_linear_gt_mean'],  iteration)
+                tb_writer.add_scalar('diag/linear_ratio',     diag['ema_linear_ratio'],    iteration)
+                # 噪声模型健康度
+                tb_writer.add_scalar('diag/sigma2_mean',      diag['ema_sigma2_mean'],     iteration)
+                tb_writer.add_scalar('diag/snr_mean',         diag['ema_snr_mean'],        iteration)
+                # 暗区 vs 亮区（核心验证指标）
+                tb_writer.add_scalar('diag/dark_l1',          diag['ema_dark_l1'],         iteration)
+                tb_writer.add_scalar('diag/bright_l1',        diag['ema_bright_l1'],       iteration)
+                tb_writer.add_scalar('diag/dark_weight',      diag['ema_dark_weight'],     iteration)
+                tb_writer.add_scalar('diag/bright_weight',    diag['ema_bright_weight'],   iteration)
+                tb_writer.add_scalar('diag/num_gaussians',    diag['num_gaussians'],       iteration)
+
+            # ---- 每500步打印一次诊断报告（控制台）----
+            if opt.use_raw_nll and iteration % 500 == 0 and iteration > 0:
+                print(f"\n{'='*60}")
+                print(f"[PhysNoise 诊断] iter={iteration}")
+                print(f"  [损失]    NLL={diag['ema_nll_loss']:.5f}  L1_sRGB={diag['ema_l1_srgb']:.5f}  SSIM={diag['ema_ssim']:.4f}")
+                print(f"  [线性域]  pred_mean={diag['ema_linear_pred_mean']:.4f}  gt_mean={diag['ema_linear_gt_mean']:.4f}  ratio={diag['ema_linear_ratio']:.3f}")
+                print(f"            {'✓ 尺度对齐' if 0.5<diag['ema_linear_ratio']<2.0 else '✗ 尺度偏差过大，检查逆gamma或sensor_gain参数'}")
+                print(f"  [噪声]    σ²={diag['ema_sigma2_mean']:.6f}  SNR={diag['ema_snr_mean']:.2f}")
+                print(f"            {'✓ SNR合理' if diag['ema_snr_mean']>1.0 else '✗ SNR<1，noise_a/b过大，暗区被完全忽略'}")
+                print(f"  [暗/亮区] dark_L1={diag['ema_dark_l1']:.5f}  bright_L1={diag['ema_bright_l1']:.5f}")
+                print(f"  [NLL权重] dark={diag['ema_dark_weight']:.4f}  bright={diag['ema_bright_weight']:.4f}")
+                weight_ratio = diag['ema_bright_weight'] / (diag['ema_dark_weight'] + 1e-8)
+                print(f"            bright/dark权重比={weight_ratio:.2f}  {'✓ 亮区权重更高（正确）' if weight_ratio>1.5 else '✗ 暗亮区权重接近，物理加权未生效'}")
+                print(f"  [高斯数]  {diag['num_gaussians']:,} 个")
+                print(f"{'='*60}")
 
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
