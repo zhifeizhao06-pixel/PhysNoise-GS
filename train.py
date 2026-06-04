@@ -169,7 +169,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+        # PhysNoise-GS: NLL 模式下用 softplus 线性辐射渲染
+        _use_linear = (opt.use_raw_nll and noise_model is not None)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg,
+                            use_trained_exp=dataset.train_test_exp,
+                            separate_sh=SPARSE_ADAM_AVAILABLE,
+                            use_linear_radiance=_use_linear)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         if viewpoint_cam.alpha_mask is not None:

@@ -10,12 +10,13 @@
 #
 
 import torch
+import torch.nn.functional as F
 import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, use_linear_radiance=False):
     """
     Render the scene. 
     
@@ -72,7 +73,17 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     shs = None
     colors_precomp = None
     if override_color is None:
-        if pipe.convert_SHs_python:
+        if use_linear_radiance:
+            # PhysNoise-GS: 线性辐射模式
+            # 在 Python 端做 SH 求值，用 softplus 激活保证非负线性辐射
+            # 与原版 sigmoid 的区别：softplus 输出无上界，表示真实物理辐射强度
+            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
+            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
+            dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
+            sh2linear = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
+            # softplus: 平滑非负激活，梯度比 relu 更好
+            colors_precomp = F.softplus(sh2linear)   # [N, 3]，线性辐射，范围 [0, +∞)
+        elif pipe.convert_SHs_python:
             shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
             dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
@@ -117,14 +128,20 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     #
-    # PhysNoise-GS: 当使用 RAW NLL 损失时，输出线性辐射（不 clamp 到 [0,1]）
-    # 线性辐射须为非负，用 relu 代替 clamp(0,1) 的上界裁剪
-    # 在标准 sRGB 模式下保留原有 clamp(0,1) 行为
-    linear_render = rendered_image.clamp(min=0.0)           # 非负线性辐射（PhysNoise用）
-    rendered_image = rendered_image.clamp(0, 1)             # sRGB 兼容输出（原版行为）
+    # PhysNoise-GS:
+    #   use_linear_radiance=True:  rendered_image 已经是 softplus 线性辐射（通过colors_precomp）
+    #                              render_linear = rendered_image（真正的线性辐射）
+    #   use_linear_radiance=False: 标准模式，clamp 到 [0,1]
+    if use_linear_radiance:
+        linear_render = rendered_image.clamp(min=0.0)       # 线性辐射（softplus保证非负）
+        rendered_image = linear_render.clamp(0, 1)          # 截断用于viewer显示
+    else:
+        linear_render = rendered_image.clamp(min=0.0)       # fallback（与rendered_image相同）
+        rendered_image = rendered_image.clamp(0, 1)
+
     out = {
         "render": rendered_image,
-        "render_linear": linear_render,                     # PhysNoise-GS: 线性辐射输出
+        "render_linear": linear_render,                     # PhysNoise-GS: 真正的线性辐射输出
         "viewspace_points": screenspace_points,
         "visibility_filter" : (radii > 0).nonzero(),
         "radii": radii,
