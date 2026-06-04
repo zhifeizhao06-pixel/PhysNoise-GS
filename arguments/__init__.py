@@ -101,11 +101,15 @@ class OptimizationParams(ParamGroup):
         # 是否启用 RAW 域 NLL 损失（阶段1核心开关）
         self.use_raw_nll = False
         # CMOS 噪声参数（针对逆gamma后线性域，值域约0~0.1的低光PNG场景）
-        # a: shot noise系数，建议 0.1~0.5（使σ²随信号变化）
-        # b: read noise方差，建议 1e-6~1e-7（远小于信号，避免σ²退化为常数）
-        # 错误示例：b=0.001（信号均值~0.015时，b完全主导σ²，退化为L2）
-        self.noise_a = 0.2
-        self.noise_b = 1e-6
+        # a: shot noise系数（信号相关项）
+        # b: read noise方差（信号无关项）
+        # 针对逆gamma后线性域（信号均值~0.016）的推荐参数：
+        #   a=0.01, b=1e-4 → max_weight=5000, SNR~1.5，梯度稳定
+        # 警告：b过小（如1e-7）会使极暗像素权重高达500万，导致高斯数爆炸
+        self.noise_a = 0.01
+        self.noise_b = 1e-4
+        # NLL逐像素权重上界（防止极暗像素梯度爆炸，默认1000）
+        self.nll_max_weight = 1000.0
         # 传感器增益 = ISO/100 * 曝光时间（用于线性辐射→RAW转换）
         self.sensor_gain = 1.0
         # 黑电平（减去后 RAW 值应≥0）

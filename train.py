@@ -200,7 +200,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 loss = snr_weighted_l1(pred_raw, gt_raw,
                                        a=opt.noise_a, b=opt.noise_b)
             else:
-                loss = noise_model.nll_loss(linear_image, gt_linear)
+                loss = noise_model.nll_loss(linear_image, gt_linear,
+                                            max_weight=opt.nll_max_weight)
 
             # sRGB 感知监督：渲染线性值经 gamma 压缩后与原始 GT 比较
             # 这样 SSIM 在感知上一致的 sRGB 域计算，补偿纯 NLL 的感知不足

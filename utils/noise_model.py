@@ -63,29 +63,40 @@ class CMOSNoiseModel:
           a = 0.1  ~ 0.5   （shot noise，使亮区σ²明显大于暗区）
           b = 1e-6 ~ 1e-7  （read noise floor，远小于信号均值）
         错误参数示例：b=0.001（远大于信号，σ²≈常数，退化为L2）
+        参数选取建议（信号均值~0.016的低光线性域）：
+          a=0.01, b=1e-4  → max_weight=5000，SNR合理，梯度稳定
         """
-        return (self.a * expected_raw + self.b).clamp(min=1e-8)
+        # σ² 下界设为 b（保证极暗像素权重不超过 1/(2b)）
+        sigma2_min = max(self.b, 1e-6)
+        return (self.a * expected_raw + self.b).clamp(min=sigma2_min)
 
     def nll_loss(self, pred_linear: torch.Tensor,
-                 target_raw: torch.Tensor) -> torch.Tensor:
+                 target_raw: torch.Tensor,
+                 max_weight: float = 1000.0) -> torch.Tensor:
         """
         异方差高斯负对数似然损失（方案公式 4.1）：
 
             L_NLL = Σ [ (D - x̂)² / (2σ²) + 0.5·log(σ²) ]
 
-        注意：σ²(x̂) 中的 x̂ 使用 stop-gradient（.detach()），
-        防止模型靠放大方差来降低损失。
+        注意：
+        1. σ²(x̂) 中的 x̂ 使用 stop-gradient（.detach()），
+           防止模型靠放大方差来降低损失。
+        2. 逐像素权重 1/(2σ²) 用 max_weight 截断，
+           防止极暗像素产生天文数字梯度导致高斯爆炸。
 
         Args:
             pred_linear:  渲染出的线性辐射 [C, H, W]，范围 [0, ∞)
-            target_raw:   真实 RAW 观测（已减黑电平并归一化）[C, H, W]
+            target_raw:   真实 RAW 观测（已归一化）[C, H, W]
+            max_weight:   逐像素权重上界（默认1000，防止梯度爆炸）
         Returns:
             标量损失值
         """
         pred_raw = self.linear_to_raw(pred_linear)                  # 线性辐射 → 期望RAW
         sigma2 = self.noise_variance(pred_raw.detach())             # stop-gradient 方差
-        nll = (pred_raw - target_raw) ** 2 / (2.0 * sigma2) \
-              + 0.5 * torch.log(sigma2)
+        # 截断权重：防止极暗像素（σ²极小）产生爆炸梯度
+        sigma2_clamped = sigma2.clamp(min=1.0 / (2.0 * max_weight))
+        nll = (pred_raw - target_raw) ** 2 / (2.0 * sigma2_clamped) \
+              + 0.5 * torch.log(sigma2_clamped)
         return nll.mean()
 
     def snr_map(self, pred_linear: torch.Tensor) -> torch.Tensor:
